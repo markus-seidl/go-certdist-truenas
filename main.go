@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -69,97 +71,119 @@ type JobProgress struct {
 }
 
 func main() {
+	// Setup zerolog
+	InitLogger()
+
 	// Define command-line flags for certificate and key paths
 	certPath := flag.String("cert", "", "Path to the fullchain.pem certificate file")
 	keyPath := flag.String("key", "", "Path to the privkey.pem file")
 	flag.Parse()
 
 	if *certPath == "" || *keyPath == "" {
-		flag.Usage()
-		os.Exit(1)
+		log.Fatal().Msg("TRUENAS_URL and TRUENAS_API_KEY environment variables must be set.")
 	}
+
+	log.Info().
+		Str("certPath", *certPath).
+		Str("keyPath", *keyPath).
+		Msg("Configuration loaded")
 
 	// Get TrueNAS details from environment variables
 	truenasURL := os.Getenv("TRUENAS_URL")
 	truenasAPIKey := os.Getenv("TRUENAS_API_KEY")
 
 	if truenasURL == "" || truenasAPIKey == "" {
-		log.Fatal("TRUENAS_URL and TRUENAS_API_KEY environment variables must be set.")
+		log.Fatal().Msg("TRUENAS_URL and TRUENAS_API_KEY environment variables must be set.")
 	}
 
-	fmt.Println("Configuration loaded:")
-	fmt.Printf("  Certificate Path: %s\n", *certPath)
-	fmt.Printf("  Private Key Path: %s\n", *keyPath)
-	fmt.Printf("  TrueNAS URL: %s\n", truenasURL)
+	log.Info().
+		Str("truenasURL", truenasURL).
+		Msg("TrueNAS URL loaded")
 
 	// Read certificate and key files
 	cert, err := os.ReadFile(*certPath)
 	if err != nil {
-		log.Fatalf("Failed to read certificate file: %v", err)
+		log.Fatal().Err(err).Msg("Failed to read certificate file")
 	}
 
 	key, err := os.ReadFile(*keyPath)
 	if err != nil {
-		log.Fatalf("Failed to read private key file: %v", err)
+		log.Fatal().Err(err).Msg("Failed to read private key file")
 	}
 
-	fmt.Println("Successfully read certificate and key files.")
+	log.Info().Msg("Successfully read certificate and key files.")
 
 	// Implement WebSocket connection and API call
 	updateCertificate(truenasURL, truenasAPIKey, string(cert), string(key))
 }
 
+func InitLogger() {
+	consoleWriter := zerolog.NewConsoleWriter(func(w *zerolog.ConsoleWriter) {
+		w.Out = os.Stdout
+		w.TimeFormat = "2006-01-02 15:04:05"
+		w.FormatLevel = func(i interface{}) string {
+			s := fmt.Sprintf("%s", i)
+			if len(s) > 4 {
+				s = s[:4]
+			}
+			return s
+		}
+	})
+
+	log.Logger = log.Output(consoleWriter).With().Caller().Logger()
+}
+
 func updateCertificate(truenasURL, apiKey, cert, key string) {
 	conn, err := newTrueNASClient(truenasURL, apiKey)
 	if err != nil {
-		log.Fatalf("Failed to connect to TrueNAS: %v", err)
+		log.Fatal().Err(err).Msg("Failed to connect to TrueNAS")
 	}
 	defer conn.Close()
 
 	// Check current UI certificate
 	currentCertID, err := getCurrentUICertificateID(conn)
 	if err != nil {
-		log.Fatalf("Failed to get current UI certificate: %v", err)
+		log.Fatal().Err(err).Msg("Failed to get current UI certificate")
 	}
 
 	// Find our certificate if it exists
 	certID, err := findCertificateID(conn, "go-certdist")
 	if err != nil {
-		log.Fatalf("Failed to query for certificate: %v", err)
+		log.Fatal().Err(err).Msg("Failed to query for certificate")
 	}
 
 	// If the current UI certificate is our cert, switch to default first
 	if certID != -1 && currentCertID == certID {
-		log.Println("Current UI certificate is the one we want to update, switching to default certificate...")
+		log.Info().Msg("Current UI certificate is the one we want to update, switching to default certificate...")
 		if err := setUICertificate(conn, 1); err != nil { // 1 is typically the default TrueNAS certificate
-			log.Fatalf("Failed to switch to default certificate: %v", err)
+			log.Fatal().Err(err).Msg("Failed to switch to default certificate")
 		}
 	}
 
 	// Delete the old certificate if it exists
 	if certID != -1 {
 		if err := deleteCertificate(conn, "go-certdist", certID); err != nil {
-			log.Fatalf("Failed to delete old certificate: %v", err)
+			log.Fatal().Err(err).Msg("Failed to delete old certificate")
 		}
 	}
 
 	// Create the new certificate
 	if err := createCertificate(conn, "go-certdist", cert, key); err != nil {
-		log.Fatalf("Failed to create new certificate: %v", err)
+		log.Fatal().Err(err).Msg("Failed to create new certificate")
 	}
 
 	// Get the new certificate ID
 	newCertID, err := findCertificateID(conn, "go-certdist")
 	if err != nil {
-		log.Fatalf("Failed to find new certificate: %v", err)
+		log.Fatal().Err(err).Msg("Failed to find new certificate")
 	}
 
 	// Set the UI to use the new certificate
 	if err := setUICertificate(conn, newCertID); err != nil {
-		log.Fatalf("Failed to set UI certificate: %v", err)
+		log.Fatal().Err(err).Msg("Failed to set UI certificate")
 	}
 
-	log.Println("Certificate update process completed successfully.")
+	log.Info().Msg("Certificate update process completed successfully.")
 }
 
 // getCurrentUICertificateID returns the ID of the current UI certificate
@@ -168,6 +192,7 @@ func getCurrentUICertificateID(conn *websocket.Conn) (int64, error) {
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
 		Method:  "system.general.config",
+		Params:  []interface{}{},
 	}
 
 	result, err := callAndWait(conn, req)
@@ -197,7 +222,7 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 		wsScheme = "wss"
 	}
 	wsURL := fmt.Sprintf("%s://%s/api/current", wsScheme, u.Host)
-	log.Println("WebSocket URL:", wsURL)
+	log.Info().Str("url", wsURL).Msg("Connecting to WebSocket")
 
 	// Configure dialer to skip TLS verification
 	dialer := websocket.DefaultDialer
@@ -231,13 +256,14 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("failed to read authentication response: %w", err)
 	}
+	logJsonResponse(loginResp)
 
 	if loginResp.Error != nil {
 		conn.Close()
 		return nil, fmt.Errorf("authentication failed: %v", loginResp.Error)
 	}
 
-	log.Println("Successfully connected and authenticated with TrueNAS.")
+	log.Info().Msg("Successfully connected and authenticated with TrueNAS.")
 	// No subscription needed, we'll use direct job status queries
 
 	return conn, nil
@@ -270,7 +296,7 @@ func findCertificateID(conn *websocket.Conn, name string) (int64, error) {
 	}
 
 	if len(results) == 0 {
-		log.Printf("No certificate named '%s' found.", name)
+		log.Info().Str("name", name).Msg("No certificate with given name found.")
 		return -1, nil // Not found is not an error
 	}
 
@@ -284,7 +310,7 @@ func findCertificateID(conn *websocket.Conn, name string) (int64, error) {
 		return -1, fmt.Errorf("could not find ID for certificate '%s'", name)
 	}
 
-	log.Printf("Found existing certificate '%s' with ID: %d.", name, int64(certIDFloat))
+	log.Info().Str("name", name).Int64("id", int64(certIDFloat)).Msg("Found existing certificate")
 	return int64(certIDFloat), nil
 }
 
@@ -377,10 +403,13 @@ func waitForJobCompletion(conn *websocket.Conn, jobID int64, timeout time.Durati
 				return nil, fmt.Errorf("job %d was aborted", jobID)
 			}
 
-			log.Printf("Job %d (%s) status: %s - %d%% - %s",
-				job.ID, job.Method, job.State,
-				int(job.Progress.Percent),
-				job.Progress.Description)
+			log.Debug().
+				Int64("jobID", job.ID).
+				Str("method", job.Method).
+				Str("state", job.State).
+				Int("progress", int(job.Progress.Percent)).
+				Str("description", job.Progress.Description).
+				Msg("Job status update")
 		}
 	}
 }
@@ -397,7 +426,7 @@ func callAndWait(conn *websocket.Conn, req JSONRPCRequest) (json.RawMessage, err
 	if err := conn.ReadJSON(&resp); err != nil {
 		return nil, fmt.Errorf("error reading response: %w", err)
 	}
-	fmt.Println("ReqId", reqId)
+	log.Debug().Str("reqId", reqId).Msg("Initial response received")
 	logJsonResponse(resp)
 
 	// If the response has an error, return it
@@ -428,7 +457,7 @@ func callAndWait(conn *websocket.Conn, req JSONRPCRequest) (json.RawMessage, err
 }
 
 func deleteCertificate(conn *websocket.Conn, name string, certID int64) error {
-	log.Printf("Deleting existing certificate '%s' (ID: %d)...", name, certID)
+	log.Info().Str("name", name).Int64("id", certID).Msg("Deleting certificate")
 	deleteReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -441,12 +470,12 @@ func deleteCertificate(conn *websocket.Conn, name string, certID int64) error {
 		return fmt.Errorf("certificate deletion failed: %w", err)
 	}
 
-	log.Println("Successfully deleted old certificate.")
+	log.Info().Msg("Successfully deleted old certificate.")
 	return nil
 }
 
 func createCertificate(conn *websocket.Conn, name, cert, key string) error {
-	log.Printf("Creating new certificate '%s'...", name)
+	log.Info().Str("name", name).Msg("Creating new certificate")
 	createReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -465,22 +494,23 @@ func createCertificate(conn *websocket.Conn, name, cert, key string) error {
 		return fmt.Errorf("certificate creation failed: %w", err)
 	}
 
-	log.Println("Successfully created certificate on TrueNAS.")
+	log.Info().Msg("Successfully created certificate on TrueNAS.")
 	return nil
 }
 
 func logJsonResponse(resp interface{}) {
-	jsonResp, err := json.Marshal(resp)
+	// Pretty-print the JSON response for debugging
+	prettyJSON, err := json.MarshalIndent(resp, "", "  ")
 	if err != nil {
-		log.Printf("Error marshaling response to JSON: %v. Raw response: %+v", err, resp)
-	} else {
-		log.Println("TrueNAS response:", string(jsonResp))
+		log.Warn().Err(err).Msg("Failed to marshal JSON for logging")
+		return
 	}
+	log.Debug().RawJSON("response", prettyJSON).Msg("JSON Response")
 }
 
 // setUICertificate sets the UI to use the specified certificate ID
 func setUICertificate(conn *websocket.Conn, certID int64) error {
-	log.Printf("Setting UI certificate to use certificate with ID: %d...", certID)
+	log.Info().Int64("certID", certID).Msg("Setting UI certificate")
 	updateReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -495,6 +525,6 @@ func setUICertificate(conn *websocket.Conn, certID int64) error {
 		return fmt.Errorf("UI certificate update failed: %w", err)
 	}
 
-	log.Println("Successfully updated UI certificate.")
+	log.Info().Msg("Successfully updated UI certificate.")
 	return nil
 }
