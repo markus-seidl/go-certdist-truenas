@@ -185,6 +185,11 @@ func updateCertificate(truenasURL, apiKey, cert, key string) {
 	}
 
 	log.Info().Msg("Certificate update process completed successfully.")
+
+	// Restart the UI to apply the new certificate
+	if err := restartUI(conn); err != nil {
+		log.Fatal().Err(err).Msg("Failed to restart TrueNAS UI")
+	}
 }
 
 // getCurrentUICertificateID returns the ID of the current UI certificate
@@ -518,5 +523,24 @@ func setUICertificate(conn *TrueNASConn, certID int64) error {
 	}
 
 	log.Info().Msg("Successfully updated UI certificate.")
+	return nil
+}
+
+// restartUI triggers a restart of the TrueNAS web UI.
+func restartUI(conn *TrueNASConn) error {
+	log.Info().Msg("Requesting TrueNAS UI restart...")
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      uuid.New().String(),
+		Method:  "system.general.ui_restart",
+		Params:  []interface{}{},
+	}
+
+	_, err := callAndWait(conn, req)
+	if err != nil {
+		return fmt.Errorf("failed to restart UI: %w", err)
+	}
+
+	log.Info().Msg("UI restart command issued successfully. It may take a minute for the UI to be available again.")
 	return nil
 }
