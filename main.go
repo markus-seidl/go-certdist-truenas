@@ -72,6 +72,7 @@ type JobProgress struct {
 
 func main() {
 	// Setup zerolog
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	InitLogger()
 
 	// Define command-line flags for certificate and key paths
@@ -187,7 +188,7 @@ func updateCertificate(truenasURL, apiKey, cert, key string) {
 }
 
 // getCurrentUICertificateID returns the ID of the current UI certificate
-func getCurrentUICertificateID(conn *websocket.Conn) (int64, error) {
+func getCurrentUICertificateID(conn *TrueNASConn) (int64, error) {
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -201,16 +202,18 @@ func getCurrentUICertificateID(conn *websocket.Conn) (int64, error) {
 	}
 
 	var config struct {
-		UICertificateID int64 `json:"ui_certificate"`
+		UICertificate struct {
+			ID int64 `json:"id"`
+		} `json:"ui_certificate"`
 	}
 	if err := json.Unmarshal(result, &config); err != nil {
 		return -1, fmt.Errorf("failed to unmarshal system config: %w", err)
 	}
 
-	return config.UICertificateID, nil
+	return config.UICertificate.ID, nil
 }
 
-func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
+func newTrueNASClient(truenasURL, apiKey string) (*TrueNASConn, error) {
 	// Construct WebSocket URL
 	u, err := url.Parse(truenasURL)
 	if err != nil {
@@ -237,6 +240,8 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to TrueNAS WebSocket: %w", err)
 	}
+	// Wrap the connection
+	tnc := &TrueNASConn{Conn: conn}
 
 	// Authenticate
 	loginReq := JSONRPCRequest{
@@ -246,30 +251,29 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 		Params:  []interface{}{apiKey},
 	}
 
-	if err := conn.WriteJSON(loginReq); err != nil {
-		conn.Close()
+	if err := tnc.WriteJSON(loginReq); err != nil {
+		tnc.Close()
 		return nil, fmt.Errorf("failed to send authentication request: %w", err)
 	}
 
 	var loginResp JSONRPCResponse
-	if err := conn.ReadJSON(&loginResp); err != nil {
-		conn.Close()
+	if err := tnc.ReadJSON(&loginResp); err != nil {
+		tnc.Close()
 		return nil, fmt.Errorf("failed to read authentication response: %w", err)
 	}
-	logJsonResponse(loginResp)
 
 	if loginResp.Error != nil {
-		conn.Close()
+		tnc.Close()
 		return nil, fmt.Errorf("authentication failed: %v", loginResp.Error)
 	}
 
 	log.Info().Msg("Successfully connected and authenticated with TrueNAS.")
 	// No subscription needed, we'll use direct job status queries
 
-	return conn, nil
+	return tnc, nil
 }
 
-func findCertificateID(conn *websocket.Conn, name string) (int64, error) {
+func findCertificateID(conn *TrueNASConn, name string) (int64, error) {
 	queryReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -315,7 +319,7 @@ func findCertificateID(conn *websocket.Conn, name string) (int64, error) {
 }
 
 // getJobStatus queries the status of a specific job
-func getJobStatus(conn *websocket.Conn, jobID int64) (*JobFields, error) {
+func getJobStatus(conn *TrueNASConn, jobID int64) (*JobFields, error) {
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -333,7 +337,6 @@ func getJobStatus(conn *websocket.Conn, jobID int64) (*JobFields, error) {
 	if err := conn.ReadJSON(&resp); err != nil {
 		return nil, fmt.Errorf("failed to read job status response: %w", err)
 	}
-	logJsonResponse(resp)
 
 	if resp.Error != nil {
 		return nil, fmt.Errorf("error getting job status: %v", resp.Error)
@@ -371,7 +374,7 @@ func getJobStatus(conn *websocket.Conn, jobID int64) (*JobFields, error) {
 }
 
 // waitForJobCompletion waits for a job to complete
-func waitForJobCompletion(conn *websocket.Conn, jobID int64, timeout time.Duration) (*JobFields, error) {
+func waitForJobCompletion(conn *TrueNASConn, jobID int64, timeout time.Duration) (*JobFields, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -414,7 +417,7 @@ func waitForJobCompletion(conn *websocket.Conn, jobID int64, timeout time.Durati
 	}
 }
 
-func callAndWait(conn *websocket.Conn, req JSONRPCRequest) (json.RawMessage, error) {
+func callAndWait(conn *TrueNASConn, req JSONRPCRequest) (json.RawMessage, error) {
 	if err := conn.WriteJSON(req); err != nil {
 		return nil, fmt.Errorf("failed to send request '%s': %w", req.Method, err)
 	}
@@ -427,7 +430,6 @@ func callAndWait(conn *websocket.Conn, req JSONRPCRequest) (json.RawMessage, err
 		return nil, fmt.Errorf("error reading response: %w", err)
 	}
 	log.Debug().Str("reqId", reqId).Msg("Initial response received")
-	logJsonResponse(resp)
 
 	// If the response has an error, return it
 	if resp.Error != nil {
@@ -456,7 +458,7 @@ func callAndWait(conn *websocket.Conn, req JSONRPCRequest) (json.RawMessage, err
 	return result, nil
 }
 
-func deleteCertificate(conn *websocket.Conn, name string, certID int64) error {
+func deleteCertificate(conn *TrueNASConn, name string, certID int64) error {
 	log.Info().Str("name", name).Int64("id", certID).Msg("Deleting certificate")
 	deleteReq := JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -474,7 +476,7 @@ func deleteCertificate(conn *websocket.Conn, name string, certID int64) error {
 	return nil
 }
 
-func createCertificate(conn *websocket.Conn, name, cert, key string) error {
+func createCertificate(conn *TrueNASConn, name, cert, key string) error {
 	log.Info().Str("name", name).Msg("Creating new certificate")
 	createReq := JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -498,18 +500,8 @@ func createCertificate(conn *websocket.Conn, name, cert, key string) error {
 	return nil
 }
 
-func logJsonResponse(resp interface{}) {
-	// Pretty-print the JSON response for debugging
-	prettyJSON, err := json.MarshalIndent(resp, "", "  ")
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to marshal JSON for logging")
-		return
-	}
-	log.Debug().RawJSON("response", prettyJSON).Msg("JSON Response")
-}
-
 // setUICertificate sets the UI to use the specified certificate ID
-func setUICertificate(conn *websocket.Conn, certID int64) error {
+func setUICertificate(conn *TrueNASConn, certID int64) error {
 	log.Info().Int64("certID", certID).Msg("Setting UI certificate")
 	updateReq := JSONRPCRequest{
 		JSONRPC: "2.0",
