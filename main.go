@@ -32,7 +32,6 @@ type JSONRPCResponse struct {
 	ID      string      `json:"id"`
 	Result  interface{} `json:"result"`
 	Error   interface{} `json:"error"`
-	Msg     string      `json:"msg"`
 }
 
 type WebsocketMessage struct {
@@ -42,11 +41,9 @@ type WebsocketMessage struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   interface{}     `json:"error,omitempty"`
-	Msg     string          `json:"msg,omitempty"` // For non-jsonrpc messages like 'changed'
 }
 
 type CollectionUpdateParams struct {
-	Msg        string     `json:"msg"`
 	Collection string     `json:"collection"`
 	Fields     *JobFields `json:"fields,omitempty"`
 }
