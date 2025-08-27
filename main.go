@@ -57,6 +57,10 @@ type JobFields struct {
 	State      string          `json:"state"`
 	Result     json.RawMessage `json:"result"`
 	Error      interface{}     `json:"error"`
+	Exception  string          `json:"exception"`
+	Abortable  bool            `json:"abortable"`
+	Timeout    int             `json:"timeout"`
+	Username   string          `json:"username"`
 }
 
 type JobProgress struct {
@@ -112,26 +116,73 @@ func updateCertificate(truenasURL, apiKey, cert, key string) {
 	}
 	defer conn.Close()
 
+	// Check current UI certificate
+	currentCertID, err := getCurrentUICertificateID(conn)
+	if err != nil {
+		log.Fatalf("Failed to get current UI certificate: %v", err)
+	}
+
+	// Find our certificate if it exists
 	certID, err := findCertificateID(conn, "go-certdist")
 	if err != nil {
 		log.Fatalf("Failed to query for certificate: %v", err)
 	}
 
+	// If the current UI certificate is our cert, switch to default first
+	if certID != -1 && currentCertID == certID {
+		log.Println("Current UI certificate is the one we want to update, switching to default certificate...")
+		if err := setUICertificate(conn, 1); err != nil { // 1 is typically the default TrueNAS certificate
+			log.Fatalf("Failed to switch to default certificate: %v", err)
+		}
+	}
+
+	// Delete the old certificate if it exists
 	if certID != -1 {
 		if err := deleteCertificate(conn, "go-certdist", certID); err != nil {
 			log.Fatalf("Failed to delete old certificate: %v", err)
 		}
 	}
 
+	// Create the new certificate
 	if err := createCertificate(conn, "go-certdist", cert, key); err != nil {
 		log.Fatalf("Failed to create new certificate: %v", err)
 	}
 
-	if err := setUICertificate(conn); err != nil {
+	// Get the new certificate ID
+	newCertID, err := findCertificateID(conn, "go-certdist")
+	if err != nil {
+		log.Fatalf("Failed to find new certificate: %v", err)
+	}
+
+	// Set the UI to use the new certificate
+	if err := setUICertificate(conn, newCertID); err != nil {
 		log.Fatalf("Failed to set UI certificate: %v", err)
 	}
 
 	log.Println("Certificate update process completed successfully.")
+}
+
+// getCurrentUICertificateID returns the ID of the current UI certificate
+func getCurrentUICertificateID(conn *websocket.Conn) (int64, error) {
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      uuid.New().String(),
+		Method:  "system.general.config",
+	}
+
+	result, err := callAndWait(conn, req)
+	if err != nil {
+		return -1, fmt.Errorf("failed to get system general config: %w", err)
+	}
+
+	var config struct {
+		UICertificateID int64 `json:"ui_certificate"`
+	}
+	if err := json.Unmarshal(result, &config); err != nil {
+		return -1, fmt.Errorf("failed to unmarshal system config: %w", err)
+	}
+
+	return config.UICertificateID, nil
 }
 
 func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
@@ -187,31 +238,7 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 	}
 
 	log.Println("Successfully connected and authenticated with TrueNAS.")
-
-	// Subscribe to job updates
-	subReq := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      uuid.New().String(),
-		Method:  "core.subscribe",
-		Params:  []interface{}{"core.get_jobs"},
-	}
-
-	if err := conn.WriteJSON(subReq); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to send subscription request: %w", err)
-	}
-
-	var subResp JSONRPCResponse
-	if err := conn.ReadJSON(&subResp); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to read subscription response: %w", err)
-	}
-	logJsonResponse(subResp)
-	//if subResp.Msg != "ready" {
-	conn.Close()
-	//return nil, fmt.Errorf("failed to subscribe to jobs, server sent: %s", subResp.Msg)
-	//}
-	log.Println("Successfully subscribed to core.get_jobs.")
+	// No subscription needed, we'll use direct job status queries
 
 	return conn, nil
 }
@@ -261,79 +288,143 @@ func findCertificateID(conn *websocket.Conn, name string) (int64, error) {
 	return int64(certIDFloat), nil
 }
 
+// getJobStatus queries the status of a specific job
+func getJobStatus(conn *websocket.Conn, jobID int64) (*JobFields, error) {
+	req := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      uuid.New().String(),
+		Method:  "core.get_jobs",
+		Params: []interface{}{
+			[]interface{}{[]interface{}{"id", "=", jobID}},
+		},
+	}
+
+	if err := conn.WriteJSON(req); err != nil {
+		return nil, fmt.Errorf("failed to send job status request: %w", err)
+	}
+
+	var resp JSONRPCResponse
+	if err := conn.ReadJSON(&resp); err != nil {
+		return nil, fmt.Errorf("failed to read job status response: %w", err)
+	}
+	logJsonResponse(resp)
+
+	if resp.Error != nil {
+		return nil, fmt.Errorf("error getting job status: %v", resp.Error)
+	}
+
+	// Handle different response formats
+	var job JobFields
+	switch v := resp.Result.(type) {
+	case []interface{}:
+		if len(v) == 0 {
+			return nil, fmt.Errorf("job %d not found", jobID)
+		}
+		// Convert the first item to JSON and then unmarshal to JobFields
+		jobData, err := json.Marshal(v[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal job data: %w", err)
+		}
+		if err := json.Unmarshal(jobData, &job); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal job data: %w", err)
+		}
+	case map[string]interface{}:
+		// Directly unmarshal if it's a single job object
+		jobData, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal job data: %w", err)
+		}
+		if err := json.Unmarshal(jobData, &job); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal job data: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unexpected job data format: %T", v)
+	}
+
+	return &job, nil
+}
+
+// waitForJobCompletion waits for a job to complete
+func waitForJobCompletion(conn *websocket.Conn, jobID int64, timeout time.Duration) (*JobFields, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timed out waiting for job %d to complete", jobID)
+		case <-ticker.C:
+			job, err := getJobStatus(conn, jobID)
+			if err != nil {
+				return nil, err
+			}
+
+			switch job.State {
+			case "SUCCESS":
+				return job, nil
+			case "FAILED":
+				errorMsg := "unknown error"
+				if job.Error != nil {
+					errorMsg = fmt.Sprintf("%v", job.Error)
+				} else if job.Exception != "" {
+					errorMsg = job.Exception
+				}
+				return nil, fmt.Errorf("job %d failed: %s", jobID, errorMsg)
+			case "ABORTED":
+				return nil, fmt.Errorf("job %d was aborted", jobID)
+			}
+
+			log.Printf("Job %d (%s) status: %s - %d%% - %s",
+				job.ID, job.Method, job.State,
+				int(job.Progress.Percent),
+				job.Progress.Description)
+		}
+	}
+}
+
 func callAndWait(conn *websocket.Conn, req JSONRPCRequest) (json.RawMessage, error) {
 	if err := conn.WriteJSON(req); err != nil {
 		return nil, fmt.Errorf("failed to send request '%s': %w", req.Method, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	reqId := req.ID
 
-	var jobID int64 = -1
-	var jobState string
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("timed out waiting for response for method '%s' (Job ID: %d)", req.Method, jobID)
-		default:
-			var msg WebsocketMessage
-			if err := conn.ReadJSON(&msg); err != nil {
-				return nil, fmt.Errorf("error reading websocket message: %w", err)
-			}
-
-			// Handle final RPC result
-			if msg.ID == req.ID {
-				if msg.Error != nil {
-					return nil, fmt.Errorf("received final error for method '%s': %v", req.Method, msg.Error)
-				}
-				// We have the final result, but we should wait for the job to be 'SUCCESS' just in case.
-				if jobState == "SUCCESS" {
-					log.Printf("Received final result for job %d.", jobID)
-					return msg.Result, nil
-				}
-				// If we get here, the final result arrived before the final job state update. We'll wait for it.
-			}
-
-			// Handle job notifications
-			if msg.Method == "collection_update" {
-				var update CollectionUpdateParams
-				if err := json.Unmarshal(msg.Params, &update); err != nil {
-					log.Printf("Failed to unmarshal collection_update params: %v", err)
-					continue
-				}
-
-				if update.Collection != "core.get_jobs" || update.Fields == nil {
-					continue
-				}
-
-				// Check if this job belongs to our request
-				isOurJob := false
-				if jobID != -1 && update.Fields.ID == jobID {
-					isOurJob = true
-				} else {
-					for _, msgID := range update.Fields.MessageIDs {
-						if msgID == req.ID {
-							isOurJob = true
-							jobID = update.Fields.ID // Found our job ID
-							break
-						}
-					}
-				}
-
-				if !isOurJob {
-					continue
-				}
-
-				jobState = update.Fields.State
-				log.Printf("Job %d (%s): %d%% - %s [%s]", jobID, update.Fields.Method, int(update.Fields.Progress.Percent), update.Fields.Progress.Description, jobState)
-
-				if jobState == "FAILED" {
-					return nil, fmt.Errorf("job %d for method '%s' failed: %v", jobID, req.Method, update.Fields.Error)
-				}
-			}
-		}
+	// For the initial response
+	var resp JSONRPCResponse
+	if err := conn.ReadJSON(&resp); err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
 	}
+	fmt.Println("ReqId", reqId)
+	logJsonResponse(resp)
+
+	// If the response has an error, return it
+	if resp.Error != nil {
+		return nil, fmt.Errorf("error in response: %v", resp.Error)
+	}
+
+	// If the response contains a job ID, wait for it to complete
+	var jobID int64
+	if id, ok := resp.Result.(float64); ok {
+		jobID = int64(id)
+	}
+
+	if jobID > 0 {
+		job, err := waitForJobCompletion(conn, jobID, 5*time.Minute)
+		if err != nil {
+			return nil, fmt.Errorf("error waiting for job %d: %w", jobID, err)
+		}
+		return job.Result, nil
+	}
+
+	// If no job ID, return the raw result
+	result, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal result: %w", err)
+	}
+	return result, nil
 }
 
 func deleteCertificate(conn *websocket.Conn, name string, certID int64) error {
@@ -387,17 +478,9 @@ func logJsonResponse(resp interface{}) {
 	}
 }
 
-func setUICertificate(conn *websocket.Conn) error {
-	log.Println("Searching for UI certificate 'go-certdist'...")
-	certID, err := findCertificateID(conn, "go-certdist")
-	if err != nil {
-		return fmt.Errorf("failed to find certificate 'go-certdist': %w", err)
-	}
-	if certID == -1 {
-		return fmt.Errorf("certificate 'go-certdist' not found after creation")
-	}
-
-	log.Printf("Setting UI certificate to new certificate with ID: %d...", certID)
+// setUICertificate sets the UI to use the specified certificate ID
+func setUICertificate(conn *websocket.Conn, certID int64) error {
+	log.Printf("Setting UI certificate to use certificate with ID: %d...", certID)
 	updateReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -407,7 +490,7 @@ func setUICertificate(conn *websocket.Conn) error {
 		}},
 	}
 
-	_, err = callAndWait(conn, updateReq)
+	_, err := callAndWait(conn, updateReq)
 	if err != nil {
 		return fmt.Errorf("UI certificate update failed: %w", err)
 	}
