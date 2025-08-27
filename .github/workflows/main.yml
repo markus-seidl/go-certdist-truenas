@@ -80,8 +80,8 @@ jobs:
       - name: Move artifacts to build directory
         run: |
           mkdir -p build/linux/amd64 build/linux/arm64
-          mv artifacts/certdist-truenas-linux-amd64/certdist-truenas-linux-amd64 build/linux/amd64/certdist
-          mv artifacts/certdist-truenas-linux-arm64/certdist-truenas-linux-arm64 build/linux/arm64/certdist
+          mv artifacts/certdist-truenas-linux-amd64/certdist-truenas-linux-amd64 build/linux/amd64/certdist-truenas
+          mv artifacts/certdist-truenas-linux-arm64/certdist-truenas-linux-arm64 build/linux/arm64/certdist-truenas
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
