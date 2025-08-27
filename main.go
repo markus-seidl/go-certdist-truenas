@@ -72,7 +72,6 @@ type JobProgress struct {
 
 func main() {
 	// Setup zerolog
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	InitLogger()
 
 	// Define command-line flags for certificate and key paths
@@ -132,6 +131,7 @@ func InitLogger() {
 	})
 
 	log.Logger = log.Output(consoleWriter).With().Caller().Logger()
+	//zerolog.SetGlobalLevel(zerolog.InfoLevel)
 }
 
 func updateCertificate(truenasURL, apiKey, cert, key string) {
