@@ -2,5 +2,5 @@
 
 set -e
 
-echo "Using configuration file: $CERTDIST_YAML_PATH"
-/certdist client "$CERTDIST_YAML_PATH"
+echo "Using configuration file: $PERSIST_DIR/config.yml"
+/certdist client "$PERSIST_DIR/config.yml"

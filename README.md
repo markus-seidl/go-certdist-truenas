@@ -6,7 +6,8 @@
 * Needs
   * TRUENAS_URL
   * TRUENAS_API_KEY
-  * CERTDIST_YAML_PATH
+  * PERSIST_DIR
+    * Contains configuration and certificate files
 
 Example certdist.yaml:
 
@@ -19,8 +20,8 @@ age_key:
 certificate:
   - domain: "example.com"
     # this directory must match the certdist-truenas command below
-    directory: "/tmp/certdist/"
+    directory: "/config/"
     renew_commands:
-      - "/certdist-truenas -cert /tmp/certdist/fullchain.pem -key /tmp/certdist/privkey.pem "
+      - "/certdist-truenas -cert /config/fullchain.pem -key /config/privkey.pem "
 ```
 
