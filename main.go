@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -17,7 +18,6 @@ import (
 // JSONRPCRequest represents a JSON-RPC 2.0 request.
 type JSONRPCRequest struct {
 	JSONRPC string        `json:"jsonrpc"`
-	Msg     string        `json:"msg"`
 	ID      string        `json:"id"`
 	Method  string        `json:"method"`
 	Params  []interface{} `json:"params"`
@@ -26,7 +26,6 @@ type JSONRPCRequest struct {
 // JSONRPCResponse represents a JSON-RPC 2.0 response.
 type JSONRPCResponse struct {
 	JSONRPC string      `json:"jsonrpc"`
-	Msg     string      `json:"msg"`
 	ID      string      `json:"id"`
 	Result  interface{} `json:"result"`
 	Error   interface{} `json:"error"`
@@ -89,8 +88,6 @@ func updateCertificate(truenasURL, apiKey, cert, key string) {
 		if err := deleteCertificate(conn, certID); err != nil {
 			log.Fatalf("Failed to delete old certificate: %v", err)
 		}
-		// TrueNAS needs some time to process this deletion, maybe there is something inside it, that references
-		// certificates by name (instead of ID). If we create the new certificate too fast, it will not be created
 		// waiting is a hack, but it works.
 		log.Println("Waiting for 3 seconds for TrueNAS to settle...")
 		time.Sleep(3 * time.Second)
@@ -98,6 +95,15 @@ func updateCertificate(truenasURL, apiKey, cert, key string) {
 
 	if err := createCertificate(conn, "go-certdist", cert, key); err != nil {
 		log.Fatalf("Failed to create new certificate: %v", err)
+	}
+
+	// After creation of the certificate an internal job is started inside of truenas to analyze the certificate
+	// so we don't get the id right after creation. We need to wait a bit and then search for the certificate.
+	log.Println("Waiting for 5 seconds for TrueNAS to process the new certificate...")
+	time.Sleep(5 * time.Second)
+
+	if err := setUICertificate(conn); err != nil {
+		log.Fatalf("Failed to set UI certificate: %v", err)
 	}
 
 	log.Println("Certificate update process completed successfully.")
@@ -134,7 +140,6 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 	// Authenticate
 	loginReq := JSONRPCRequest{
 		JSONRPC: "2.0",
-		Msg:     "method",
 		ID:      uuid.New().String(),
 		Method:  "auth.login_with_api_key",
 		Params:  []interface{}{apiKey},
@@ -163,7 +168,6 @@ func newTrueNASClient(truenasURL, apiKey string) (*websocket.Conn, error) {
 func findCertificateID(conn *websocket.Conn, name string) (int64, error) {
 	queryReq := JSONRPCRequest{
 		JSONRPC: "2.0",
-		Msg:     "method",
 		ID:      uuid.New().String(),
 		Method:  "certificate.query",
 		Params:  []interface{}{[]interface{}{[]string{"name", "=", name}}},
@@ -210,7 +214,6 @@ func deleteCertificate(conn *websocket.Conn, id int64) error {
 	log.Printf("Deleting certificate with ID: %d...", id)
 	deleteReq := JSONRPCRequest{
 		JSONRPC: "2.0",
-		Msg:     "method",
 		ID:      uuid.New().String(),
 		Method:  "certificate.delete",
 		Params:  []interface{}{id},
@@ -237,7 +240,6 @@ func createCertificate(conn *websocket.Conn, name, cert, key string) error {
 	log.Printf("Creating new certificate '%s'...", name)
 	createReq := JSONRPCRequest{
 		JSONRPC: "2.0",
-		Msg:     "method",
 		ID:      uuid.New().String(),
 		Method:  "certificate.create",
 		Params: []interface{}{map[string]interface{}{
@@ -257,11 +259,58 @@ func createCertificate(conn *websocket.Conn, name, cert, key string) error {
 	if err := conn.ReadJSON(&createResp); err != nil {
 		return fmt.Errorf("failed to read certificate create response: %w", err)
 	}
+	logJsonResponse(createResp)
 
 	if createResp.Error != nil {
 		return fmt.Errorf("certificate creation failed: %v", createResp.Error)
 	}
 
 	log.Println("Successfully created certificate on TrueNAS.")
+	return nil
+}
+
+func logJsonResponse(createResp JSONRPCResponse) {
+	jsonResp, err := json.Marshal(createResp)
+	if err != nil {
+		log.Printf("Error marshaling response to JSON: %v. Raw response: %+v", err, createResp)
+	} else {
+		log.Println("TrueNAS response:", string(jsonResp))
+	}
+}
+
+func setUICertificate(conn *websocket.Conn) error {
+	log.Println("Searching for UI certificate 'go-certdist'...")
+	certID, err := findCertificateID(conn, "go-certdist")
+	if err != nil {
+		return fmt.Errorf("failed to find certificate 'go-certdist': %w", err)
+	}
+	if certID == -1 {
+		return fmt.Errorf("certificate 'go-certdist' not found after creation")
+	}
+
+	log.Printf("Setting UI certificate to new certificate with ID: %d...", certID)
+	updateReq := JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      uuid.New().String(),
+		Method:  "system.general.update",
+		Params: []interface{}{map[string]interface{}{
+			"ui_certificate": certID,
+		}},
+	}
+
+	if err := conn.WriteJSON(updateReq); err != nil {
+		return fmt.Errorf("failed to send UI certificate update request: %w", err)
+	}
+
+	var updateResp JSONRPCResponse
+	if err := conn.ReadJSON(&updateResp); err != nil {
+		return fmt.Errorf("failed to read UI certificate update response: %w", err)
+	}
+
+	if updateResp.Error != nil {
+		return fmt.Errorf("UI certificate update failed: %v", updateResp.Error)
+	}
+
+	log.Println("Successfully updated UI certificate.")
 	return nil
 }
