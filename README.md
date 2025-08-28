@@ -1,5 +1,7 @@
 
+# go-certdist-truenas
 
+Certdist "plugin" (=App) for TrueNAS, which automatically updates the certificate of your TrueNAS instance.
 
 ## Configuration
 
@@ -49,4 +51,6 @@ We are using the custom apps feature of TrueNAS.
     * Mount Path: /config
     * Add your config directory and map it to /config
       * Ensure that the user the container runs in, is allowed to write to the /config path (!)
-    
+* Note: When the certificate update is successful you will be logged out of the admin UI, maybe right after the installation. This is required because of the installation of the new certificate, which requires a WebUI restart.
+
+

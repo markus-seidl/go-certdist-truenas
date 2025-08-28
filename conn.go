@@ -14,8 +14,14 @@ var (
 	privKeyRegexp = regexp.MustCompile(`-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----`)
 )
 
-// TrueNASConn wraps a websocket connection to provide logging.
-type TrueNASConn struct {
+type TrueNASConnection interface {
+	WriteJSON(interface{}) error
+	ReadJSON(interface{}) error
+	Close() error
+}
+
+// WebsocketTrueNASConnection wraps a websocket connection to provide logging.
+type WebsocketTrueNASConnection struct {
 	*websocket.Conn
 }
 
@@ -25,7 +31,7 @@ func filterSecrets(data []byte) []byte {
 	return filtered
 }
 
-func (c *TrueNASConn) WriteJSON(v interface{}) error {
+func (c *WebsocketTrueNASConnection) WriteJSON(v interface{}) error {
 	// Log request before sending
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -39,7 +45,7 @@ func (c *TrueNASConn) WriteJSON(v interface{}) error {
 	return c.Conn.WriteJSON(v)
 }
 
-func (c *TrueNASConn) ReadJSON(v interface{}) error {
+func (c *WebsocketTrueNASConnection) ReadJSON(v interface{}) error {
 	err := c.Conn.ReadJSON(v)
 	if err != nil {
 		return err
@@ -54,4 +60,9 @@ func (c *TrueNASConn) ReadJSON(v interface{}) error {
 	}
 
 	return nil
+}
+
+// Close closes the underlying websocket connection.
+func (c *WebsocketTrueNASConnection) Close() error {
+	return c.Conn.Close()
 }

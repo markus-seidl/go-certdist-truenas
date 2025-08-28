@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -18,60 +19,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// JSONRPCRequest represents a JSON-RPC 2.0 request.
-type JSONRPCRequest struct {
-	JSONRPC string        `json:"jsonrpc"`
-	ID      string        `json:"id"`
-	Method  string        `json:"method"`
-	Params  []interface{} `json:"params"`
-}
-
-// JSONRPCResponse represents a JSON-RPC 2.0 response.
-type JSONRPCResponse struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      string      `json:"id"`
-	Result  interface{} `json:"result"`
-	Error   interface{} `json:"error"`
-}
-
-type WebsocketMessage struct {
-	JSONRPC string          `json:"jsonrpc,omitempty"`
-	ID      string          `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   interface{}     `json:"error,omitempty"`
-}
-
-type CollectionUpdateParams struct {
-	Collection string     `json:"collection"`
-	Fields     *JobFields `json:"fields,omitempty"`
-}
-
-type JobFields struct {
-	ID         int64           `json:"id"`
-	Method     string          `json:"method"`
-	MessageIDs []string        `json:"message_ids,omitempty"`
-	Progress   JobProgress     `json:"progress"`
-	State      string          `json:"state"`
-	Result     json.RawMessage `json:"result"`
-	Error      interface{}     `json:"error"`
-	Exception  string          `json:"exception"`
-	Abortable  bool            `json:"abortable"`
-	Timeout    int             `json:"timeout"`
-	Username   string          `json:"username"`
-}
-
-type JobProgress struct {
-	Percent     float64 `json:"percent"`
-	Description string  `json:"description"`
-}
-
 func main() {
 	// Setup zerolog
 	InitLogger()
 
 	// Define command-line flags for certificate and key paths
+	truenasURL := flag.String("truenas_url", os.Getenv("TRUENAS_URL"), "TrueNAS WebSocket URL (e.g., ws://truenas.local/websocket)")
+	truenasAPIKey := flag.String("api_key", os.Getenv("TRUENAS_API_KEY"), "TrueNAS API Key")
 	certPath := flag.String("cert", "", "Path to the fullchain.pem certificate file")
 	keyPath := flag.String("key", "", "Path to the privkey.pem file")
 	flag.Parse()
@@ -85,16 +39,12 @@ func main() {
 		Str("keyPath", *keyPath).
 		Msg("Configuration loaded")
 
-	// Get TrueNAS details from environment variables
-	truenasURL := os.Getenv("TRUENAS_URL")
-	truenasAPIKey := os.Getenv("TRUENAS_API_KEY")
-
-	if truenasURL == "" || truenasAPIKey == "" {
+	if *truenasURL == "" || *truenasAPIKey == "" {
 		log.Fatal().Msg("TRUENAS_URL and TRUENAS_API_KEY environment variables must be set.")
 	}
 
 	log.Info().
-		Str("truenasURL", truenasURL).
+		Str("truenasURL", *truenasURL).
 		Msg("TrueNAS URL loaded")
 
 	// Read certificate and key files
@@ -111,7 +61,18 @@ func main() {
 	log.Info().Msg("Successfully read certificate and key files.")
 
 	// Implement WebSocket connection and API call
-	updateCertificate(truenasURL, truenasAPIKey, string(cert), string(key))
+	conn, err := newTrueNASClient(*truenasURL, *truenasAPIKey)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to connect to TrueNAS")
+	}
+	defer func(conn TrueNASConnection) {
+		err := conn.Close()
+		if err != nil {
+			log.Fatal().Err(err).Msg("Can't close TrueNAS connection.")
+		}
+	}(conn)
+
+	updateCertificate(conn, string(cert), string(key))
 }
 
 func InitLogger() {
@@ -125,19 +86,22 @@ func InitLogger() {
 			}
 			return s
 		}
+		w.FormatCaller = func(i interface{}) string {
+			s, ok := i.(string)
+			if !ok {
+				return ""
+			}
+			// Shorten the file path to just the filename and line number.
+			short := filepath.Base(s)
+			return short
+		}
 	})
 
 	log.Logger = log.Output(consoleWriter).With().Caller().Logger()
 	//zerolog.SetGlobalLevel(zerolog.InfoLevel)
 }
 
-func updateCertificate(truenasURL, apiKey, cert, key string) {
-	conn, err := newTrueNASClient(truenasURL, apiKey)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to connect to TrueNAS")
-	}
-	defer conn.Close()
-
+func updateCertificate(conn TrueNASConnection, cert, key string) {
 	// Check current UI certificate
 	currentCertID, err := getCurrentUICertificateID(conn)
 	if err != nil {
@@ -190,7 +154,7 @@ func updateCertificate(truenasURL, apiKey, cert, key string) {
 }
 
 // getCurrentUICertificateID returns the ID of the current UI certificate
-func getCurrentUICertificateID(conn *TrueNASConn) (int64, error) {
+func getCurrentUICertificateID(conn TrueNASConnection) (int64, error) {
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -215,7 +179,7 @@ func getCurrentUICertificateID(conn *TrueNASConn) (int64, error) {
 	return config.UICertificate.ID, nil
 }
 
-func newTrueNASClient(truenasURL, apiKey string) (*TrueNASConn, error) {
+func newTrueNASClient(truenasURL, apiKey string) (TrueNASConnection, error) {
 	// Construct WebSocket URL
 	u, err := url.Parse(truenasURL)
 	if err != nil {
@@ -243,7 +207,7 @@ func newTrueNASClient(truenasURL, apiKey string) (*TrueNASConn, error) {
 		return nil, fmt.Errorf("failed to connect to TrueNAS WebSocket: %w", err)
 	}
 	// Wrap the connection
-	tnc := &TrueNASConn{Conn: conn}
+	tnc := &WebsocketTrueNASConnection{Conn: conn}
 
 	// Authenticate
 	loginReq := JSONRPCRequest{
@@ -254,18 +218,15 @@ func newTrueNASClient(truenasURL, apiKey string) (*TrueNASConn, error) {
 	}
 
 	if err := tnc.WriteJSON(loginReq); err != nil {
-		tnc.Close()
 		return nil, fmt.Errorf("failed to send authentication request: %w", err)
 	}
 
 	var loginResp JSONRPCResponse
 	if err := tnc.ReadJSON(&loginResp); err != nil {
-		tnc.Close()
 		return nil, fmt.Errorf("failed to read authentication response: %w", err)
 	}
 
 	if loginResp.Error != nil {
-		tnc.Close()
 		return nil, fmt.Errorf("authentication failed: %v", loginResp.Error)
 	}
 
@@ -275,7 +236,7 @@ func newTrueNASClient(truenasURL, apiKey string) (*TrueNASConn, error) {
 	return tnc, nil
 }
 
-func findCertificateID(conn *TrueNASConn, name string) (int64, error) {
+func findCertificateID(conn TrueNASConnection, name string) (int64, error) {
 	queryReq := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -321,7 +282,7 @@ func findCertificateID(conn *TrueNASConn, name string) (int64, error) {
 }
 
 // getJobStatus queries the status of a specific job
-func getJobStatus(conn *TrueNASConn, jobID int64) (*JobFields, error) {
+func getJobStatus(conn TrueNASConnection, jobID int64) (*JobFields, error) {
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
 		ID:      uuid.New().String(),
@@ -376,7 +337,7 @@ func getJobStatus(conn *TrueNASConn, jobID int64) (*JobFields, error) {
 }
 
 // waitForJobCompletion waits for a job to complete
-func waitForJobCompletion(conn *TrueNASConn, jobID int64, timeout time.Duration) (*JobFields, error) {
+func waitForJobCompletion(conn TrueNASConnection, jobID int64, timeout time.Duration) (*JobFields, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -419,7 +380,7 @@ func waitForJobCompletion(conn *TrueNASConn, jobID int64, timeout time.Duration)
 	}
 }
 
-func callAndWait(conn *TrueNASConn, req JSONRPCRequest) (json.RawMessage, error) {
+func callAndWait(conn TrueNASConnection, req JSONRPCRequest) (json.RawMessage, error) {
 	if err := conn.WriteJSON(req); err != nil {
 		return nil, fmt.Errorf("failed to send request '%s': %w", req.Method, err)
 	}
@@ -460,7 +421,7 @@ func callAndWait(conn *TrueNASConn, req JSONRPCRequest) (json.RawMessage, error)
 	return result, nil
 }
 
-func deleteCertificate(conn *TrueNASConn, name string, certID int64) error {
+func deleteCertificate(conn TrueNASConnection, name string, certID int64) error {
 	log.Info().Str("name", name).Int64("id", certID).Msg("Deleting certificate")
 	deleteReq := JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -478,7 +439,7 @@ func deleteCertificate(conn *TrueNASConn, name string, certID int64) error {
 	return nil
 }
 
-func createCertificate(conn *TrueNASConn, name, cert, key string) error {
+func createCertificate(conn TrueNASConnection, name, cert, key string) error {
 	log.Info().Str("name", name).Msg("Creating new certificate")
 	createReq := JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -503,7 +464,7 @@ func createCertificate(conn *TrueNASConn, name, cert, key string) error {
 }
 
 // setUICertificate sets the UI to use the specified certificate ID
-func setUICertificate(conn *TrueNASConn, certID int64) error {
+func setUICertificate(conn TrueNASConnection, certID int64) error {
 	log.Info().Int64("certID", certID).Msg("Setting UI certificate")
 	updateReq := JSONRPCRequest{
 		JSONRPC: "2.0",
@@ -524,7 +485,7 @@ func setUICertificate(conn *TrueNASConn, certID int64) error {
 }
 
 // restartUI triggers a restart of the TrueNAS web UI.
-func restartUI(conn *TrueNASConn) error {
+func restartUI(conn TrueNASConnection) error {
 	log.Info().Msg("Requesting TrueNAS UI restart...")
 	req := JSONRPCRequest{
 		JSONRPC: "2.0",
