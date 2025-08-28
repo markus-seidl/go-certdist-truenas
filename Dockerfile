@@ -1,4 +1,4 @@
-FROM alpine:latest
+FROM ghcr.io/markus-seidl/go-certdist:1.1.1
 
 ARG TARGETPLATFORM
 
